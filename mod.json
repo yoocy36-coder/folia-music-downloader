@@ -1,0 +1,13 @@
+{
+  "folium": 1,
+  "id": "music-downloader",
+  "name": "缓存下载器",
+  "version": "0.1.0",
+  "author": "Fy",
+  "description": "在播放器的进度条旁加一个下载按钮，把当前歌曲从 Folia 自己的本地音频缓存复制到音乐文件夹，并同时写出 .lrc 歌词。只读取本机缓存，不联网、不调用任何在线音源接口。",
+  "main": "index.cjs",
+  "client": "client.mjs",
+  "preview": "preview.jpg",
+  "permissions": [],
+  "folia": ">=0.7.20 <0.8.0"
+}
