@@ -1,14 +1,13 @@
 // music-downloader / index.cjs
-// Node half: copy the audio Folia already cached for a song into the user's
-// Music folder. It never touches the network; everything comes from the local
-// media cache.
+// Node half: download a resolved audio URL into the user's Music folder.
+// Folia resolves the URL for each platform (its Omni providers); this entry
+// only streams the bytes to disk, so no per-platform API code lives here.
 
 'use strict';
 
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { app } = require('electron');
+const { app, net } = require('electron');
 
 const MIME_EXTENSIONS = {
     'audio/mp4': 'm4a',
@@ -26,15 +25,8 @@ const MIME_EXTENSIONS = {
     'audio/aac': 'aac',
 };
 
-const SNIFF_EXTENSIONS = [
-    ['ftypM4A', 'm4a'],
-    ['ftypisom', 'm4a'],
-    ['ftypmp42', 'm4a'],
-    ['fLaC', 'flac'],
-    ['OggS', 'ogg'],
-    ['RIFF', 'wav'],
-    ['ID3', 'mp3'],
-];
+const BROWSER_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const sanitizeFileName = (value) => {
     const cleaned = String(value ?? '')
@@ -43,65 +35,6 @@ const sanitizeFileName = (value) => {
         .trim()
         .replace(/[. ]+$/g, '');
     return cleaned.slice(0, 120) || '未命名';
-};
-
-const cacheDirectory = () => {
-    try {
-        const configPath = path.join(app.getPath('userData'), 'config.json');
-        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        const configured = config?.CACHE_DIRECTORY;
-        if (typeof configured === 'string' && configured.trim()) return configured.trim();
-    } catch {
-        /* default below */
-    }
-    return path.join(app.getPath('userData'), 'media-cache');
-};
-
-const cachePaths = (song) => {
-    const cacheKey = `audio_online:${song.source}:${song.id}`;
-    const baseName = crypto.createHash('sha256').update(cacheKey).digest('hex');
-    const audioDirectory = path.join(cacheDirectory(), 'audio');
-    return {
-        cacheKey,
-        dataPath: path.join(audioDirectory, `${baseName}.bin`),
-        metaPath: path.join(audioDirectory, `${baseName}.json`),
-    };
-};
-
-const sniffExtension = (filePath) => {
-    try {
-        const header = fs.readFileSync(filePath).subarray(0, 16);
-        const text = header.toString('latin1');
-        for (const [signature, extension] of SNIFF_EXTENSIONS) {
-            if (text.includes(signature)) return extension;
-        }
-    } catch {
-        /* unreadable */
-    }
-    return 'bin';
-};
-
-const describeCache = (song) => {
-    if (!song || typeof song.source !== 'string' || typeof song.id !== 'string' || !song.source || !song.id) {
-        return { cached: false, reason: 'unsupported', size: 0, mimeType: null, extension: null };
-    }
-    const { dataPath, metaPath } = cachePaths(song);
-    let size = 0;
-    try {
-        size = fs.statSync(dataPath).size;
-    } catch {
-        return { cached: false, reason: 'missing', size: 0, mimeType: null, extension: null };
-    }
-    let mimeType = null;
-    try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-        mimeType = typeof meta?.mimeType === 'string' ? meta.mimeType : null;
-    } catch {
-        /* meta optional */
-    }
-    let extension = MIME_EXTENSIONS[String(mimeType ?? '').toLowerCase()] ?? null;
-    if (!extension) extension = sniffExtension(dataPath);
-    return { cached: true, reason: 'cached', size, mimeType, extension };
 };
 
 const uniqueTarget = (directory, baseName, extension) => {
@@ -114,50 +47,93 @@ const uniqueTarget = (directory, baseName, extension) => {
     return candidate;
 };
 
-module.exports = function activate(api) {
-    api.rpc.handle('status', (songs) => {
-        const list = Array.isArray(songs) ? songs.slice(0, 500) : [];
-        return list.map((song) => ({
-            ...describeCache(song),
-            source: typeof song?.source === 'string' ? song.source : null,
-            id: typeof song?.id === 'string' ? song.id : null,
-        }));
-    });
+const contentTypeToExtension = (contentType) => {
+    const mime = String(contentType ?? '').split(';')[0].trim().toLowerCase();
+    return MIME_EXTENSIONS[mime] ?? null;
+};
 
+module.exports = function activate(api) {
     api.rpc.handle('download', async (payload) => {
-        const song = payload?.song ?? null;
-        const info = describeCache(song);
-        if (!info.cached) {
-            return { ok: false, code: info.reason === 'unsupported' ? 'unsupported-song' : 'not-cached' };
+        const url = payload?.url;
+        const song = payload?.song ?? {};
+        if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+            return { ok: false, code: 'invalid-url' };
         }
-        const { dataPath } = cachePaths(song);
-        const extension = info.extension ?? 'bin';
         const musicDirectory = app.getPath('music');
         const displayName = sanitizeFileName(`${song.title ?? '未命名'} - ${song.artist ?? '未知歌手'}`);
-        const targetPath = uniqueTarget(musicDirectory, displayName, extension);
-        try {
-            fs.copyFileSync(dataPath, targetPath);
-        } catch (error) {
-            return { ok: false, code: 'write-failed', detail: error?.message ?? null };
-        }
+        const tempPath = path.join(app.getPath('temp'), `folia-dl-${Date.now()}-${Math.random().toString(36).slice(2)}.part`);
 
-        let lyricsPath = null;
-        const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
-        if (lyrics.trim()) {
-            try {
-                lyricsPath = path.join(path.dirname(targetPath), `${path.basename(targetPath, `.${extension}`)}.lrc`);
-                fs.writeFileSync(lyricsPath, lyrics, 'utf8');
-            } catch {
-                lyricsPath = null;
-            }
-        }
-        let size = info.size;
-        try {
-            size = fs.statSync(targetPath).size;
-        } catch {
-            /* keep the cached size */
-        }
-        api.log.info(`saved ${song.title ?? ''} to ${targetPath}`);
-        return { ok: true, filePath: targetPath, lyricsPath, extension, size };
+        return await new Promise((resolve) => {
+            let settled = false;
+            let writeStream = null;
+            let finalPath = null;
+            let total = 0;
+            const finish = (result) => {
+                if (settled) return;
+                settled = true;
+                try {
+                    writeStream?.destroy();
+                } catch {
+                    /* ignore */
+                }
+                try {
+                    fs.rmSync(tempPath, { force: true });
+                } catch {
+                    /* ignore */
+                }
+                resolve(result);
+            };
+
+            const request = net.request({ url, method: 'GET', redirect: 'follow' });
+            request.setHeader('User-Agent', BROWSER_UA);
+            request.setHeader('Accept', '*/*');
+
+            request.on('response', (response) => {
+                if (response.statusCode >= 400) {
+                    finish({ ok: false, code: `http-${response.statusCode}` });
+                    response.on('data', () => {});
+                    return;
+                }
+                let extension = contentTypeToExtension(response.headers['content-type']?.[0]) ?? null;
+                if (!extension) extension = 'm4a';
+                finalPath = uniqueTarget(musicDirectory, displayName, extension);
+                writeStream = fs.createWriteStream(tempPath);
+                writeStream.on('error', (error) => finish({ ok: false, code: 'write-failed', detail: error?.message }));
+                response.on('data', (chunk) => {
+                    total += chunk.length;
+                    if (total > 500 * 1024 * 1024) {
+                        finish({ ok: false, code: 'too-large' });
+                        request.abort();
+                        return;
+                    }
+                    writeStream.write(chunk);
+                });
+                response.on('end', () => {
+                    writeStream.end(() => {
+                        try {
+                            fs.renameSync(tempPath, finalPath);
+                        } catch (error) {
+                            finish({ ok: false, code: 'write-failed', detail: error?.message });
+                            return;
+                        }
+                        let lyricsPath = null;
+                        const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
+                        if (lyrics.trim() && finalPath) {
+                            try {
+                                lyricsPath = finalPath.replace(/\.[^.]+$/, '.lrc');
+                                fs.writeFileSync(lyricsPath, lyrics, 'utf8');
+                            } catch {
+                                lyricsPath = null;
+                            }
+                        }
+                        api.log.info(`downloaded ${song.title ?? ''} -> ${finalPath}`);
+                        finish({ ok: true, filePath: finalPath, lyricsPath, extension, size: total });
+                    });
+                });
+                response.on('error', (error) => finish({ ok: false, code: 'network', detail: error?.message }));
+            });
+            request.on('error', (error) => finish({ ok: false, code: 'network', detail: error?.message }));
+            request.end();
+        });
     });
 };

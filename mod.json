@@ -1,13 +1,14 @@
 {
   "folium": 1,
   "id": "music-downloader",
-  "name": "缓存下载器",
-  "version": "0.2.0",
+  "name": "音乐下载",
+  "version": "0.3.0",
   "author": "Fy",
-  "description": "在首页加一个「下载」页：把 Folia 已经缓存的当前歌曲或整个播放队列导出到音乐文件夹，支持批量缓存导出。只读取本机缓存，不联网、不调用任何在线音源接口。",
+  "description": "首页「下载」页：用 Folia 已适配的各个在线音源解析当前歌曲 / 整个播放队列的音频地址并保存到音乐文件夹，支持批量下载、自动适配所有 Folia 支持的平台。",
   "main": "index.cjs",
   "client": "client.mjs",
   "preview": "preview.jpg",
   "permissions": ["playback.control"],
+  "experimental": ["omni.hooks"],
   "folia": ">=0.7.20 <0.8.0"
 }

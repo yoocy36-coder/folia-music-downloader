@@ -1,8 +1,9 @@
 // music-downloader / client.mjs
-// Adds a "下载 / Downloads" page to Folia's home navigation. Everything is
-// driven by Folia's own media cache; nothing here talks to an online source.
-// The batch action can walk the current queue, let Folia cache each track
-// (muted, quickly), then export it.
+// A "下载" page in Folia's home navigation. Folia's own Omni providers resolve
+// the audio URL for every supported source (netease / QQ / kugou / qishui /
+// bodian / YouTube Music / …); this mod captures that resolved URL through the
+// official omni.audioSourceResolved hook and hands it to the main entry, which
+// streams it to the Music folder. No per-platform API code lives here.
 
 const CSS = `
 .md-root { display: flex; flex-direction: column; gap: 14px; height: 100%; min-height: 0; padding: 20px 22px; box-sizing: border-box; color: var(--folium-primary, #fff); font-family: var(--folium-font, inherit); }
@@ -52,6 +53,8 @@ const buildLrc = (song, lines) => {
     return [...head, ...body].join('\n');
 };
 
+const songKey = (song) => `${song?.source ?? ''}:${song?.id ?? ''}`;
+
 const describeSong = (song) => ({
     source: typeof song?.source === 'string' ? song.source : null,
     id: typeof song?.id === 'string' ? song.id : null,
@@ -67,13 +70,74 @@ export default function activate(folium) {
         try {
             folium.ui.toast(message, { type, durationMs: type === 'success' ? 6000 : 4000 });
         } catch {
-            /* toasts are optional */
+            /* optional */
         }
     };
-
     const rpc = (name, payload) => folium.rpc.call(name, payload);
 
+    // Resolved audio URLs, keyed by source + id. Folia resolves one every time
+    // it starts a track; the URL is what it would stream right now (so it uses
+    // the quality the user picked in Folia).
+    const resolvedUrls = new Map();
+    const urlWaiters = new Map();
     let activeToken = 0;
+
+    const hooks = folium.experimental?.['omni.hooks'];
+    let offHook = null;
+    if (hooks && typeof hooks.on === 'function') {
+        offHook = hooks.on('audioSourceResolved', (event) => {
+            const url = typeof event?.url === 'string' ? event.url : null;
+            const song = event?.song;
+            if (!url || !song) return;
+            const key = songKey(song);
+            resolvedUrls.set(key, url);
+            if (resolvedUrls.size > 500) resolvedUrls.clear();
+            const waiter = urlWaiters.get(key);
+            if (waiter) {
+                urlWaiters.delete(key);
+                waiter(url);
+            }
+        });
+    }
+
+    const waitForUrl = (song, timeoutMs = 12000) => {
+        const key = songKey(song);
+        const cached = resolvedUrls.get(key);
+        if (cached) return Promise.resolve(cached);
+        return new Promise((resolve) => {
+            let done = false;
+            const finish = (value) => {
+                if (done) return;
+                done = true;
+                urlWaiters.delete(key);
+                clearTimeout(timer);
+                resolve(value);
+            };
+            const timer = setTimeout(() => finish(null), timeoutMs);
+            urlWaiters.set(key, finish);
+            try {
+                folium.playback.playSong(song);
+            } catch {
+                finish(null);
+            }
+        });
+    };
+
+    const downloadOne = async (song, options = {}) => {
+        if (!song || !song.ref) return { ok: false, code: 'unsupported-song' };
+        const url = options.url ?? (await waitForUrl(song));
+        if (!url) return { ok: false, code: 'resolve-timeout' };
+        if (!/^https?:\/\//i.test(url)) return { ok: false, code: 'unsupported-url' };
+        let lyrics = '';
+        if (options.withLyrics) {
+            try {
+                lyrics = buildLrc(song, folium.lyrics.getLines());
+            } catch {
+                lyrics = '';
+            }
+        }
+        return await rpc('download', { url, song: describeSong(song), lyrics });
+    };
 
     const tabsHandle = folium.registries.homeTabs.register({
         id: 'downloads',
@@ -89,9 +153,10 @@ export default function activate(folium) {
             const head = document.createElement('div');
             head.className = 'md-head';
             const h1 = document.createElement('h1');
-            h1.textContent = '缓存下载器';
+            h1.textContent = '音乐下载';
             const note = document.createElement('p');
-            note.textContent = '只读取 Folia 已经缓存的音频文件，不联网、不调用音源接口。音质取决于 Folia 当前播放音质，想下载高品质请在 Folia 里把音质调到最高。';
+            note.textContent =
+                '直接用 Folia 已经适配好的各平台音源解析音频地址再下载，不需要等缓存：音质就是 Folia 当前播放音质，想要高品质先在 Folia 里把音质调到最高。';
             head.append(h1, note);
             root.append(head);
 
@@ -115,22 +180,19 @@ export default function activate(folium) {
             const refreshBtn = document.createElement('button');
             refreshBtn.className = 'md-btn';
             refreshBtn.textContent = '刷新队列';
-            const cachedBtn = document.createElement('button');
-            cachedBtn.className = 'md-btn';
-            cachedBtn.textContent = '导出已缓存';
             const allBtn = document.createElement('button');
             allBtn.className = 'md-btn primary';
-            allBtn.textContent = '缓存并导出全部';
+            allBtn.textContent = '下载整个队列';
             const stopBtn = document.createElement('button');
             stopBtn.className = 'md-btn';
             stopBtn.textContent = '停止';
             stopBtn.disabled = true;
             const spacer = document.createElement('span');
             spacer.className = 'md-spacer';
-            toolbar.append(refreshBtn, cachedBtn, allBtn, stopBtn, spacer);
+            toolbar.append(refreshBtn, allBtn, stopBtn, spacer);
             const status = document.createElement('div');
             status.className = 'md-status';
-            status.textContent = '队列为空时先播放一个歌单或队列。';
+            status.textContent = '队列为空时先播放一个歌单或专辑。';
             root.append(toolbar, status);
 
             const list = document.createElement('div');
@@ -141,12 +203,9 @@ export default function activate(folium) {
             let rows = [];
             let batch = null;
             let disposed = false;
-
             const setStatus = (text) => {
                 status.textContent = text;
             };
-
-            const songLabel = (song) => `${song.title || '未命名'}${song.artist ? ` - ${song.artist}` : ''}`;
 
             const updateCurrent = () => {
                 let current = null;
@@ -155,9 +214,9 @@ export default function activate(folium) {
                 } catch {
                     current = null;
                 }
-                currentTitle.textContent = current ? songLabel(current) : '没有正在播放的歌曲';
-                currentSub.textContent = current ? '点击右侧按钮，把它从 Folia 的本地缓存复制到系统音乐文件夹' : '';
-                currentBtn.disabled = !current;
+                currentTitle.textContent = current ? `${current.title || '未命名'}${current.artist ? ` - ${current.artist}` : ''}` : '没有正在播放的歌曲';
+                currentSub.textContent = current ? '解析当前音源地址并保存到系统音乐文件夹，同时写出歌词' : '';
+                currentBtn.disabled = !current || Boolean(batch);
                 return current;
             };
 
@@ -166,29 +225,13 @@ export default function activate(folium) {
                 if (!row) return;
                 row.badge.textContent = text;
                 row.badge.className = `md-badge${kind ? ` ${kind}` : ''}`;
-                row.downloadBtn.disabled = kind === 'wait';
             };
 
-            const waitCached = async (song, timeoutMs) => {
-                const deadline = Date.now() + timeoutMs;
-                while (!disposed && Date.now() < deadline) {
-                    try {
-                        const info = (await rpc('status', [song]))[0];
-                        if (info?.cached) return info;
-                    } catch {
-                        /* retry */
-                    }
-                    await new Promise((resolve) => setTimeout(resolve, 700));
-                }
-                return { cached: false };
-            };
-
-            const render = async () => {
+            const render = () => {
                 if (disposed) return;
                 updateCurrent();
                 try {
-                    const snapshot = folium.playback.getQueue({ limit: 500 });
-                    queueItems = Array.isArray(snapshot?.items) ? snapshot.items : [];
+                    queueItems = folium.playback.getQueue({ limit: 500 })?.items ?? [];
                 } catch {
                     queueItems = [];
                 }
@@ -202,15 +245,7 @@ export default function activate(folium) {
                     setStatus('队列为空。');
                     return;
                 }
-                setStatus(`队列共 ${queueItems.length} 首。`);
-                const songs = queueItems.map((item) => describeSong(item.song));
-                let statuses = [];
-                try {
-                    statuses = await rpc('status', songs);
-                } catch {
-                    statuses = [];
-                }
-                if (disposed) return;
+                setStatus(`队列共 ${queueItems.length} 首。批量下载会静音快速解析每首的地址。`);
                 queueItems.forEach((item, index) => {
                     const row = document.createElement('div');
                     row.className = 'md-row';
@@ -221,47 +256,31 @@ export default function activate(folium) {
                     meta.className = 'md-meta';
                     const title = document.createElement('div');
                     title.className = 'md-title';
-                    title.textContent = songLabel(item.song);
+                    title.textContent = `${item.song?.title || '未命名'}${item.song?.artist ? ` - ${item.song.artist}` : ''}`;
                     const sub = document.createElement('div');
                     sub.className = 'md-sub';
                     sub.textContent = item.song?.album || '';
                     meta.append(title, sub);
-                    const cached = Boolean(statuses[index]?.cached);
                     const badge = document.createElement('span');
-                    badge.className = `md-badge${cached ? ' ok' : ''}`;
-                    badge.textContent = cached ? (statuses[index]?.extension ?? '已缓存') : '未缓存';
+                    badge.className = 'md-badge';
+                    badge.textContent = '待下载';
                     const btn = document.createElement('button');
                     btn.className = 'md-btn';
-                    btn.textContent = cached ? '导出' : '缓存后导出';
+                    btn.textContent = '下载';
                     btn.addEventListener('click', async () => {
                         if (batch) return;
-                        const song = describeSong(item.song);
                         btn.disabled = true;
-                        badge.textContent = '检查中…';
+                        badge.textContent = '解析中…';
+                        badge.className = 'md-badge wait';
                         try {
-                            let info = (await rpc('status', [song]))[0];
-                            if (!info?.cached) {
-                                badge.textContent = '缓存中…';
-                                try {
-                                    await folium.playback.playQueueItem(item.index);
-                                } catch {
-                                    /* ignore */
-                                }
-                                info = await waitCached(song, 20000);
-                            }
-                            if (!info?.cached) {
-                                badge.textContent = '未缓存';
-                                toast('这首还没缓存，先播放一会儿', 'error');
-                                return;
-                            }
-                            const result = await rpc('download', { song });
+                            const result = await downloadOne(item.song);
                             if (result?.ok) {
-                                badge.textContent = '已导出';
+                                badge.textContent = '已下载';
                                 badge.className = 'md-badge ok';
                                 toast(`已保存：${result.filePath}`, 'success');
                             } else {
-                                badge.textContent = '导出失败';
-                                toast('导出失败，检查音乐文件夹权限', 'error');
+                                badge.textContent = result?.code === 'resolve-timeout' ? '解析超时' : '失败';
+                                toast(`下载失败：${result?.code ?? 'unknown'}`, 'error');
                             }
                         } finally {
                             btn.disabled = false;
@@ -269,18 +288,17 @@ export default function activate(folium) {
                     });
                     row.append(idx, meta, badge, btn);
                     list.append(row);
-                    rows.push({ badge, downloadBtn: btn });
+                    rows.push({ badge, button: btn });
                 });
             };
 
-            const beginBatch = async (mode) => {
+            const downloadQueue = async () => {
                 if (batch) return;
                 const token = ++activeToken;
                 batch = { token };
-                stopBtn.disabled = false;
-                cachedBtn.disabled = true;
-                allBtn.disabled = true;
                 refreshBtn.disabled = true;
+                allBtn.disabled = true;
+                stopBtn.disabled = false;
                 const original = (() => {
                     try {
                         return folium.playback.getState();
@@ -295,52 +313,43 @@ export default function activate(folium) {
                         return null;
                     }
                 })();
-                let saved = 0;
-                let mutedByUs = false;
+                let started = 0;
+                let failed = 0;
+                const downloads = [];
                 try {
-                    if (mode === 'all') {
+                    try {
                         folium.playback.setMuted(true);
-                        mutedByUs = true;
-                        setStatus('批量缓存中：会静音并把队列快速过一遍，期间请勿关闭 Folia。');
-                    } else {
-                        setStatus('正在导出已缓存的歌曲…');
+                    } catch {
+                        /* ignore */
                     }
+                    setStatus('批量解析中：会静音快速切歌，解析完再统一下载。');
                     for (let index = 0; index < queueItems.length; index += 1) {
                         if (disposed || batch?.token !== token) break;
                         const item = queueItems[index];
-                        const song = describeSong(item.song);
-                        markRow(index, mode === 'all' ? '缓存中…' : '检查中…', 'wait');
-                        let info = (await rpc('status', [song]))[0];
-                        if (!info?.cached && mode === 'all') {
-                            try {
-                                await folium.playback.playQueueItem(item.index);
-                            } catch {
-                                /* try next */
-                            }
-                            info = await waitCached(song, 25000);
-                        }
+                        markRow(index, '解析中…', 'wait');
+                        const url = await waitForUrl(item.song);
                         if (disposed || batch?.token !== token) break;
-                        if (info?.cached) {
-                            const result = await rpc('download', { song });
-                            if (result?.ok) {
-                                saved += 1;
-                                markRow(index, '已导出', 'ok');
-                            } else {
-                                markRow(index, '导出失败');
-                            }
-                        } else {
-                            markRow(index, '跳过（未缓存）');
+                        if (!url || !/^https?:\/\//i.test(url)) {
+                            failed += 1;
+                            markRow(index, '解析失败');
+                            continue;
                         }
-                        setStatus(`${index + 1}/${queueItems.length} · 已导出 ${saved} 首`);
+                        markRow(index, '下载中…', 'wait');
+                        started += 1;
+                        downloads.push(
+                            rpc('download', { url, song: describeSong(item.song) }).then((result) => {
+                                if (result?.ok) {
+                                    markRow(index, '已下载', 'ok');
+                                } else {
+                                    failed += 1;
+                                    markRow(index, '下载失败');
+                                }
+                                return result;
+                            }),
+                        );
+                        setStatus(`已提交 ${started}/${queueItems.length} 首，失败 ${failed} 首`);
                     }
                 } finally {
-                    if (mutedByUs && volume) {
-                        try {
-                            folium.playback.setMuted(volume.muted);
-                        } catch {
-                            /* ignore */
-                        }
-                    }
                     if (original?.song?.ref) {
                         try {
                             folium.playback.playSong(original.song);
@@ -349,55 +358,62 @@ export default function activate(folium) {
                             /* ignore */
                         }
                     }
-                    batch = null;
-                    stopBtn.disabled = true;
-                    cachedBtn.disabled = false;
-                    allBtn.disabled = false;
-                    refreshBtn.disabled = false;
-                    setStatus(`完成 · 本次导出 ${saved} 首到音乐文件夹`);
-                    toast(`导出完成：${saved} 首`, 'success');
+                    if (volume) {
+                        try {
+                            folium.playback.setMuted(volume.muted);
+                        } catch {
+                            /* ignore */
+                        }
+                    }
                 }
+                const results = await Promise.allSettled(downloads);
+                const ok = results.filter((entry) => entry.status === 'fulfilled' && entry.value?.ok).length;
+                failed = results.length - ok + (started - results.length);
+                batch = null;
+                refreshBtn.disabled = false;
+                allBtn.disabled = false;
+                stopBtn.disabled = true;
+                setStatus(`完成 · 成功 ${ok} 首，失败 ${Math.max(0, failed)} 首`);
+                toast(`下载完成：成功 ${ok} 首`, 'success');
             };
 
             currentBtn.addEventListener('click', async () => {
                 if (batch) return;
                 let current = null;
+                let position = 0;
                 try {
-                    current = folium.playback.getState().song;
+                    const state = folium.playback.getState();
+                    current = state.song;
+                    position = state.position;
                 } catch {
                     current = null;
                 }
                 if (!current) return;
                 currentBtn.disabled = true;
                 try {
-                    const song = describeSong(current);
-                    const info = (await rpc('status', [song]))[0];
-                    if (!info?.cached) {
-                        toast('这首还没缓存完，让它再播一会儿再点', 'error');
+                    const url = await waitForUrl(current);
+                    if (!url) {
+                        toast('解析音频地址超时', 'error');
                         return;
                     }
-                    let lyrics = '';
-                    try {
-                        lyrics = buildLrc(current, folium.lyrics.getLines());
-                    } catch {
-                        lyrics = '';
-                    }
-                    const result = await rpc('download', { song, lyrics });
+                    const result = await downloadOne(current, { url, withLyrics: true });
                     if (result?.ok) toast(`已保存：${result.filePath}`, 'success');
-                    else toast('导出失败，检查音乐文件夹权限', 'error');
+                    else toast(`下载失败：${result?.code ?? 'unknown'}`, 'error');
+                    try {
+                        folium.playback.seek(position);
+                    } catch {
+                        /* ignore */
+                    }
                 } finally {
-                    currentBtn.disabled = false;
+                    currentBtn.disabled = Boolean(batch);
                 }
             });
 
             refreshBtn.addEventListener('click', () => {
-                if (!batch) void render();
-            });
-            cachedBtn.addEventListener('click', () => {
-                if (!batch) void beginBatch('cached');
+                if (!batch) render();
             });
             allBtn.addEventListener('click', () => {
-                if (!batch) void beginBatch('all');
+                void downloadQueue();
             });
             stopBtn.addEventListener('click', () => {
                 if (!batch) return;
@@ -405,21 +421,18 @@ export default function activate(folium) {
                 batch.token = -1;
                 batch = null;
                 stopBtn.disabled = true;
-                cachedBtn.disabled = false;
-                allBtn.disabled = false;
                 refreshBtn.disabled = false;
-                setStatus('已停止（会恢复原来的播放歌曲）');
+                allBtn.disabled = false;
+                setStatus('已停止');
             });
 
-            void render();
-
+            render();
             const offSong = folium.events.on('playback.songChanged', () => {
                 if (!batch) updateCurrent();
             });
             const offQueue = folium.events.on('playback.queueChanged', () => {
-                if (!batch) void render();
+                if (!batch) render();
             });
-
             return () => {
                 disposed = true;
                 activeToken += 1;
@@ -437,11 +450,8 @@ export default function activate(folium) {
         commandHandle = folium.registries.commands.register({
             id: 'open-downloads',
             label: { 'zh-CN': '打开下载页', en: 'Open Downloads' },
-            description: {
-                'zh-CN': '打开缓存下载器页面：导出当前歌曲或当前队列已缓存的音频。',
-                en: 'Open the cache downloader page.',
-            },
-            keywords: ['download', 'downloads', '下载', '缓存', '导出'],
+            description: { 'zh-CN': '打开下载页：解析当前音源并下载当前歌曲或整个队列。', en: 'Open the download page.' },
+            keywords: ['download', '下载', '导出'],
             run() {
                 folium.ui.openHomeTab('downloads');
                 return '已打开下载页';
@@ -452,6 +462,7 @@ export default function activate(folium) {
     }
 
     return () => {
+        offHook?.();
         tabsHandle.unregister();
         commandHandle?.unregister();
     };
