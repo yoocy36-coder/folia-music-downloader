@@ -1,7 +1,7 @@
 // music-downloader / index.cjs
-// Node half: download a resolved audio URL into the user's Music folder.
-// Folia resolves the URL for each platform (its Omni providers); this entry
-// only streams the bytes to disk, so no per-platform API code lives here.
+// Node half: stream a resolved audio URL into the user's Music folder.
+// Folia's own source adapters resolve the URL; this entry only writes bytes,
+// so there is no per-platform API code here.
 
 'use strict';
 
@@ -28,6 +28,15 @@ const MIME_EXTENSIONS = {
 const BROWSER_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+const REFERERS = {
+    netease: 'https://music.163.com/',
+    qq: 'https://y.qq.com/',
+    kugou: 'https://www.kugou.com/',
+    qishui: 'https://music.douyin.com/',
+    ytm: 'https://music.youtube.com/',
+    spotify: 'https://open.spotify.com/',
+};
+
 const sanitizeFileName = (value) => {
     const cleaned = String(value ?? '')
         .replace(/[<>:"/\\|?*\u0000-\u001f]/g, ' ')
@@ -52,6 +61,83 @@ const contentTypeToExtension = (contentType) => {
     return MIME_EXTENSIONS[mime] ?? null;
 };
 
+const attemptDownload = ({ url, referer, targetPath, tempPath, timeoutMs = 120000 }) =>
+    new Promise((resolve) => {
+        let settled = false;
+        let writeStream = null;
+        let total = 0;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            try {
+                writeStream?.destroy();
+            } catch {
+                /* ignore */
+            }
+            try {
+                fs.rmSync(tempPath, { force: true });
+            } catch {
+                /* ignore */
+            }
+            resolve(result);
+        };
+        const request = net.request({ url, method: 'GET', redirect: 'follow' });
+        request.setHeader('User-Agent', BROWSER_UA);
+        request.setHeader('Accept', '*/*');
+        if (referer) request.setHeader('Referer', referer);
+        const timer = setTimeout(() => {
+            try {
+                request.abort();
+            } catch {
+                /* ignore */
+            }
+            finish({ ok: false, code: 'timeout' });
+        }, timeoutMs);
+        const done = (result) => {
+            clearTimeout(timer);
+            finish(result);
+        };
+        request.on('response', (response) => {
+            if (response.statusCode >= 400) {
+                response.on('data', () => {});
+                done({ ok: false, code: `http-${response.statusCode}` });
+                return;
+            }
+            let extension = contentTypeToExtension(response.headers['content-type']?.[0]) ?? null;
+            if (!extension) extension = 'm4a';
+            const finalPath = targetPath(extension);
+            writeStream = fs.createWriteStream(tempPath);
+            writeStream.on('error', (error) => done({ ok: false, code: 'write-failed', detail: error?.message }));
+            response.on('data', (chunk) => {
+                total += chunk.length;
+                if (total > 600 * 1024 * 1024) {
+                    try {
+                        request.abort();
+                    } catch {
+                        /* ignore */
+                    }
+                    done({ ok: false, code: 'too-large' });
+                    return;
+                }
+                writeStream.write(chunk);
+            });
+            response.on('end', () => {
+                writeStream.end(() => {
+                    try {
+                        fs.renameSync(tempPath, finalPath);
+                    } catch (error) {
+                        done({ ok: false, code: 'write-failed', detail: error?.message });
+                        return;
+                    }
+                    done({ ok: true, filePath: finalPath, extension, size: total });
+                });
+            });
+            response.on('error', (error) => done({ ok: false, code: 'network', detail: error?.message }));
+        });
+        request.on('error', (error) => done({ ok: false, code: 'network', detail: error?.message }));
+        request.end();
+    });
+
 module.exports = function activate(api) {
     api.rpc.handle('download', async (payload) => {
         const url = payload?.url;
@@ -62,78 +148,36 @@ module.exports = function activate(api) {
         const musicDirectory = app.getPath('music');
         const displayName = sanitizeFileName(`${song.title ?? '未命名'} - ${song.artist ?? '未知歌手'}`);
         const tempPath = path.join(app.getPath('temp'), `folia-dl-${Date.now()}-${Math.random().toString(36).slice(2)}.part`);
+        const targetPath = (extension) => uniqueTarget(musicDirectory, displayName, extension);
+        const referer = REFERERS[song.source] ?? null;
 
-        return await new Promise((resolve) => {
-            let settled = false;
-            let writeStream = null;
-            let finalPath = null;
-            let total = 0;
-            const finish = (result) => {
-                if (settled) return;
-                settled = true;
-                try {
-                    writeStream?.destroy();
-                } catch {
-                    /* ignore */
-                }
-                try {
-                    fs.rmSync(tempPath, { force: true });
-                } catch {
-                    /* ignore */
-                }
-                resolve(result);
-            };
+        // Some CDNs reject a foreign Referer and some require it; try with it
+        // first, then without.
+        let result = await attemptDownload({ url, referer, targetPath, tempPath });
+        if (!result.ok && referer && /^http-(403|404|412)$/.test(result.code)) {
+            result = await attemptDownload({ url, referer: null, targetPath, tempPath });
+        }
+        if (!result.ok) return result;
 
-            const request = net.request({ url, method: 'GET', redirect: 'follow' });
-            request.setHeader('User-Agent', BROWSER_UA);
-            request.setHeader('Accept', '*/*');
-
-            request.on('response', (response) => {
-                if (response.statusCode >= 400) {
-                    finish({ ok: false, code: `http-${response.statusCode}` });
-                    response.on('data', () => {});
-                    return;
-                }
-                let extension = contentTypeToExtension(response.headers['content-type']?.[0]) ?? null;
-                if (!extension) extension = 'm4a';
-                finalPath = uniqueTarget(musicDirectory, displayName, extension);
-                writeStream = fs.createWriteStream(tempPath);
-                writeStream.on('error', (error) => finish({ ok: false, code: 'write-failed', detail: error?.message }));
-                response.on('data', (chunk) => {
-                    total += chunk.length;
-                    if (total > 500 * 1024 * 1024) {
-                        finish({ ok: false, code: 'too-large' });
-                        request.abort();
-                        return;
-                    }
-                    writeStream.write(chunk);
-                });
-                response.on('end', () => {
-                    writeStream.end(() => {
-                        try {
-                            fs.renameSync(tempPath, finalPath);
-                        } catch (error) {
-                            finish({ ok: false, code: 'write-failed', detail: error?.message });
-                            return;
-                        }
-                        let lyricsPath = null;
-                        const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
-                        if (lyrics.trim() && finalPath) {
-                            try {
-                                lyricsPath = finalPath.replace(/\.[^.]+$/, '.lrc');
-                                fs.writeFileSync(lyricsPath, lyrics, 'utf8');
-                            } catch {
-                                lyricsPath = null;
-                            }
-                        }
-                        api.log.info(`downloaded ${song.title ?? ''} -> ${finalPath}`);
-                        finish({ ok: true, filePath: finalPath, lyricsPath, extension, size: total });
-                    });
-                });
-                response.on('error', (error) => finish({ ok: false, code: 'network', detail: error?.message }));
-            });
-            request.on('error', (error) => finish({ ok: false, code: 'network', detail: error?.message }));
-            request.end();
-        });
+        const finalPath = result.filePath;
+        let lyricsPath = null;
+        const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
+        if (lyrics.trim()) {
+            try {
+                lyricsPath = finalPath.replace(/\.[^.]+$/, '.lrc');
+                fs.writeFileSync(lyricsPath, lyrics, 'utf8');
+            } catch {
+                lyricsPath = null;
+            }
+        }
+        api.log.info(`downloaded ${song.title ?? ''} -> ${finalPath}`);
+        return {
+            ok: true,
+            filePath: finalPath,
+            lyricsPath,
+            extension: result.extension,
+            size: result.size,
+            quality: typeof payload?.quality === 'string' ? payload.quality : null,
+        };
     });
 };

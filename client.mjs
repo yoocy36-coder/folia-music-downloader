@@ -1,9 +1,9 @@
 // music-downloader / client.mjs
-// A "下载" page in Folia's home navigation. Folia's own Omni providers resolve
-// the audio URL for every supported source (netease / QQ / kugou / qishui /
-// bodian / YouTube Music / …); this mod captures that resolved URL through the
-// official omni.audioSourceResolved hook and hands it to the main entry, which
-// streams it to the Music folder. No per-platform API code lives here.
+// A "下载" page in Folia's home navigation. Folia's Omni providers already know
+// how to resolve an audio URL for every source it supports; this mod calls that
+// internal resolver (folium.internals.omni.getAudioSource) and streams the
+// result to the Music folder from the main entry. No per-platform API code and
+// no playback switching.
 
 const CSS = `
 .md-root { display: flex; flex-direction: column; gap: 14px; height: 100%; min-height: 0; padding: 20px 22px; box-sizing: border-box; color: var(--folium-primary, #fff); font-family: var(--folium-font, inherit); }
@@ -30,8 +30,12 @@ const CSS = `
 .md-badge { flex: none; font-size: 11px; padding: 2px 9px; border-radius: 999px; background: rgba(128,128,128,.18); opacity: .8; }
 .md-badge.ok { background: rgba(80, 200, 120, .18); opacity: .9; }
 .md-badge.wait { background: rgba(255, 190, 80, .18); }
+.md-badge.bad { background: rgba(255, 100, 100, .18); opacity: .95; }
 .md-empty { padding: 28px 16px; text-align: center; font-size: 12.5px; opacity: .55; }
 `;
+
+const QUALITY_ORDER = ['hires', 'lossless', 'high', 'standard'];
+const QUALITY_LABEL = { hires: '母带', lossless: '无损', high: '高品', standard: '标准' };
 
 const fmtTime = (seconds) => {
     const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
@@ -42,7 +46,7 @@ const fmtTime = (seconds) => {
 
 const buildLrc = (song, lines) => {
     if (!Array.isArray(lines) || lines.length === 0) return '';
-    const head = [`[ti:${song?.title ?? ''}]`, `[ar:${song?.artist ?? ''}]`, `[al:${song?.album ?? ''}]`, '[by:Folia 缓存下载器]', ''];
+    const head = [`[ti:${song?.title ?? ''}]`, `[ar:${song?.artist ?? ''}]`, `[al:${song?.album ?? ''}]`, '[by:Folia 音乐下载]', ''];
     const body = [];
     for (const line of lines) {
         if (!line || typeof line.fullText !== 'string' || !line.fullText.trim()) continue;
@@ -52,8 +56,6 @@ const buildLrc = (song, lines) => {
     }
     return [...head, ...body].join('\n');
 };
-
-const songKey = (song) => `${song?.source ?? ''}:${song?.id ?? ''}`;
 
 const describeSong = (song) => ({
     source: typeof song?.source === 'string' ? song.source : null,
@@ -68,66 +70,57 @@ export default function activate(folium) {
 
     const toast = (message, type = 'info') => {
         try {
-            folium.ui.toast(message, { type, durationMs: type === 'success' ? 6000 : 4000 });
+            folium.ui.toast(message, { type, durationMs: type === 'success' ? 6000 : 5000 });
         } catch {
             /* optional */
         }
     };
     const rpc = (name, payload) => folium.rpc.call(name, payload);
 
-    // Resolved audio URLs, keyed by source + id. Folia resolves one every time
-    // it starts a track; the URL is what it would stream right now (so it uses
-    // the quality the user picked in Folia).
-    const resolvedUrls = new Map();
-    const urlWaiters = new Map();
-    let activeToken = 0;
+    const providerSong = (song) => ({
+        ...song,
+        sourceRef: { kind: 'online', providerId: song.source, mediaId: song.id },
+    });
 
-    const hooks = folium.experimental?.['omni.hooks'];
-    let offHook = null;
-    if (hooks && typeof hooks.on === 'function') {
-        offHook = hooks.on('audioSourceResolved', (event) => {
-            const url = typeof event?.url === 'string' ? event.url : null;
-            const song = event?.song;
-            if (!url || !song) return;
-            const key = songKey(song);
-            resolvedUrls.set(key, url);
-            if (resolvedUrls.size > 500) resolvedUrls.clear();
-            const waiter = urlWaiters.get(key);
-            if (waiter) {
-                urlWaiters.delete(key);
-                waiter(url);
-            }
-        });
-    }
-
-    const waitForUrl = (song, timeoutMs = 12000) => {
-        const key = songKey(song);
-        const cached = resolvedUrls.get(key);
-        if (cached) return Promise.resolve(cached);
-        return new Promise((resolve) => {
-            let done = false;
-            const finish = (value) => {
-                if (done) return;
-                done = true;
-                urlWaiters.delete(key);
-                clearTimeout(timer);
-                resolve(value);
-            };
-            const timer = setTimeout(() => finish(null), timeoutMs);
-            urlWaiters.set(key, finish);
+    // Ask Folia's own backend for the audio URL. Try the best quality first and
+    // fall back level by level; preview clips are rejected.
+    const resolveAudio = async (song) => {
+        const omni = folium.internals?.omni;
+        if (!omni || typeof omni.getAudioSource !== 'function') throw new Error('internals-unavailable');
+        let levels = [];
+        try {
+            levels = (await omni.getAudioQualityLevels(song.source)) ?? [];
+        } catch {
+            levels = [];
+        }
+        const order = QUALITY_ORDER.filter((quality) => levels.length === 0 || levels.includes(quality));
+        if (order.length === 0) order.push(...QUALITY_ORDER);
+        let lastError = null;
+        for (const quality of order) {
             try {
-                folium.playback.playSong(song);
-            } catch {
-                finish(null);
+                const result = await omni.getAudioSource(providerSong(song), quality);
+                if (result?.url && /^https?:\/\//i.test(result.url) && !result.preview) {
+                    return { url: result.url, quality: result.quality || quality, preview: false };
+                }
+                if (result?.preview) lastError = new Error('preview-only');
+            } catch (error) {
+                lastError = error;
             }
-        });
+        }
+        try {
+            const result = await omni.getAudioSource(providerSong(song));
+            if (result?.url && /^https?:\/\//i.test(result.url) && !result.preview) {
+                return { url: result.url, quality: result.quality || 'standard', preview: false };
+            }
+            if (result?.preview) lastError = new Error('preview-only');
+        } catch (error) {
+            lastError = error;
+        }
+        throw lastError ?? new Error('no-url');
     };
 
-    const downloadOne = async (song, options = {}) => {
-        if (!song || !song.ref) return { ok: false, code: 'unsupported-song' };
-        const url = options.url ?? (await waitForUrl(song));
-        if (!url) return { ok: false, code: 'resolve-timeout' };
-        if (!/^https?:\/\//i.test(url)) return { ok: false, code: 'unsupported-url' };
+    const downloadSong = async (song, options = {}) => {
+        const audio = await resolveAudio(song);
         let lyrics = '';
         if (options.withLyrics) {
             try {
@@ -136,7 +129,12 @@ export default function activate(folium) {
                 lyrics = '';
             }
         }
-        return await rpc('download', { url, song: describeSong(song), lyrics });
+        return await rpc('download', {
+            url: audio.url,
+            quality: audio.quality,
+            song: describeSong(song),
+            lyrics,
+        });
     };
 
     const tabsHandle = folium.registries.homeTabs.register({
@@ -156,7 +154,7 @@ export default function activate(folium) {
             h1.textContent = '音乐下载';
             const note = document.createElement('p');
             note.textContent =
-                '直接用 Folia 已经适配好的各平台音源解析音频地址再下载，不需要等缓存：音质就是 Folia 当前播放音质，想要高品质先在 Folia 里把音质调到最高。';
+                '直接调用 Folia 已适配好的各平台音源解析音频地址并下载，不打断播放、不用等缓存。会自动从最高可用音质往下试；实际能拿到多高取决于你的账号权益和 Folia 的音质设置。';
             head.append(h1, note);
             root.append(head);
 
@@ -203,6 +201,7 @@ export default function activate(folium) {
             let rows = [];
             let batch = null;
             let disposed = false;
+
             const setStatus = (text) => {
                 status.textContent = text;
             };
@@ -227,6 +226,8 @@ export default function activate(folium) {
                 row.badge.className = `md-badge${kind ? ` ${kind}` : ''}`;
             };
 
+            const describeQuality = (quality) => QUALITY_LABEL[quality] ?? quality;
+
             const render = () => {
                 if (disposed) return;
                 updateCurrent();
@@ -245,7 +246,7 @@ export default function activate(folium) {
                     setStatus('队列为空。');
                     return;
                 }
-                setStatus(`队列共 ${queueItems.length} 首。批量下载会静音快速解析每首的地址。`);
+                setStatus(`队列共 ${queueItems.length} 首。`);
                 queueItems.forEach((item, index) => {
                     const row = document.createElement('div');
                     row.className = 'md-row';
@@ -259,7 +260,7 @@ export default function activate(folium) {
                     title.textContent = `${item.song?.title || '未命名'}${item.song?.artist ? ` - ${item.song.artist}` : ''}`;
                     const sub = document.createElement('div');
                     sub.className = 'md-sub';
-                    sub.textContent = item.song?.album || '';
+                    sub.textContent = `${item.song?.source ?? ''}${item.song?.album ? ` · ${item.song.album}` : ''}`;
                     meta.append(title, sub);
                     const badge = document.createElement('span');
                     badge.className = 'md-badge';
@@ -273,15 +274,18 @@ export default function activate(folium) {
                         badge.textContent = '解析中…';
                         badge.className = 'md-badge wait';
                         try {
-                            const result = await downloadOne(item.song);
+                            const result = await downloadSong(item.song);
                             if (result?.ok) {
-                                badge.textContent = '已下载';
+                                badge.textContent = `已下载${result.quality ? ` · ${describeQuality(result.quality)}` : ''}`;
                                 badge.className = 'md-badge ok';
                                 toast(`已保存：${result.filePath}`, 'success');
                             } else {
-                                badge.textContent = result?.code === 'resolve-timeout' ? '解析超时' : '失败';
-                                toast(`下载失败：${result?.code ?? 'unknown'}`, 'error');
+                                badge.textContent = `失败：${result?.code ?? 'unknown'}`;
+                                badge.className = 'md-badge bad';
                             }
+                        } catch (error) {
+                            badge.textContent = `失败：${String(error?.message ?? error).slice(0, 24)}`;
+                            badge.className = 'md-badge bad';
                         } finally {
                             btn.disabled = false;
                         }
@@ -299,111 +303,63 @@ export default function activate(folium) {
                 refreshBtn.disabled = true;
                 allBtn.disabled = true;
                 stopBtn.disabled = false;
-                const original = (() => {
-                    try {
-                        return folium.playback.getState();
-                    } catch {
-                        return null;
-                    }
-                })();
-                const volume = (() => {
-                    try {
-                        return folium.playback.getVolume();
-                    } catch {
-                        return null;
-                    }
-                })();
-                let started = 0;
+                const items = [...queueItems];
+                let cursor = 0;
+                let ok = 0;
                 let failed = 0;
-                const downloads = [];
-                try {
-                    try {
-                        folium.playback.setMuted(true);
-                    } catch {
-                        /* ignore */
-                    }
-                    setStatus('批量解析中：会静音快速切歌，解析完再统一下载。');
-                    for (let index = 0; index < queueItems.length; index += 1) {
-                        if (disposed || batch?.token !== token) break;
-                        const item = queueItems[index];
+                let done = 0;
+                const total = items.length;
+                const cancelled = () => disposed || batch?.token !== token;
+                const worker = async () => {
+                    while (!cancelled()) {
+                        const index = cursor;
+                        cursor += 1;
+                        if (index >= total) return;
+                        const item = items[index];
                         markRow(index, '解析中…', 'wait');
-                        const url = await waitForUrl(item.song);
-                        if (disposed || batch?.token !== token) break;
-                        if (!url || !/^https?:\/\//i.test(url)) {
+                        try {
+                            const result = await downloadSong(item.song);
+                            if (result?.ok) {
+                                ok += 1;
+                                markRow(index, `已下载${result.quality ? ` · ${describeQuality(result.quality)}` : ''}`, 'ok');
+                            } else {
+                                failed += 1;
+                                markRow(index, `失败：${result?.code ?? 'unknown'}`, 'bad');
+                            }
+                        } catch (error) {
                             failed += 1;
-                            markRow(index, '解析失败');
-                            continue;
+                            const message = String(error?.message ?? error);
+                            markRow(index, message.includes('preview') ? '仅试听' : '解析失败', 'bad');
                         }
-                        markRow(index, '下载中…', 'wait');
-                        started += 1;
-                        downloads.push(
-                            rpc('download', { url, song: describeSong(item.song) }).then((result) => {
-                                if (result?.ok) {
-                                    markRow(index, '已下载', 'ok');
-                                } else {
-                                    failed += 1;
-                                    markRow(index, '下载失败');
-                                }
-                                return result;
-                            }),
-                        );
-                        setStatus(`已提交 ${started}/${queueItems.length} 首，失败 ${failed} 首`);
+                        done += 1;
+                        setStatus(`${done}/${total} · 成功 ${ok} · 失败 ${failed}`);
                     }
-                } finally {
-                    if (original?.song?.ref) {
-                        try {
-                            folium.playback.playSong(original.song);
-                            folium.playback.seek(original.position ?? 0);
-                        } catch {
-                            /* ignore */
-                        }
-                    }
-                    if (volume) {
-                        try {
-                            folium.playback.setMuted(volume.muted);
-                        } catch {
-                            /* ignore */
-                        }
-                    }
-                }
-                const results = await Promise.allSettled(downloads);
-                const ok = results.filter((entry) => entry.status === 'fulfilled' && entry.value?.ok).length;
-                failed = results.length - ok + (started - results.length);
+                };
+                await Promise.all([worker(), worker(), worker()]);
                 batch = null;
                 refreshBtn.disabled = false;
                 allBtn.disabled = false;
                 stopBtn.disabled = true;
-                setStatus(`完成 · 成功 ${ok} 首，失败 ${Math.max(0, failed)} 首`);
+                setStatus(`完成 · 成功 ${ok} 首，失败 ${failed} 首`);
                 toast(`下载完成：成功 ${ok} 首`, 'success');
             };
 
             currentBtn.addEventListener('click', async () => {
                 if (batch) return;
                 let current = null;
-                let position = 0;
                 try {
-                    const state = folium.playback.getState();
-                    current = state.song;
-                    position = state.position;
+                    current = folium.playback.getState().song;
                 } catch {
                     current = null;
                 }
                 if (!current) return;
                 currentBtn.disabled = true;
                 try {
-                    const url = await waitForUrl(current);
-                    if (!url) {
-                        toast('解析音频地址超时', 'error');
-                        return;
-                    }
-                    const result = await downloadOne(current, { url, withLyrics: true });
+                    const result = await downloadSong(current, { withLyrics: true });
                     if (result?.ok) toast(`已保存：${result.filePath}`, 'success');
                     else toast(`下载失败：${result?.code ?? 'unknown'}`, 'error');
-                    try {
-                        folium.playback.seek(position);
-                    } catch {
-                        /* ignore */
-                    }
+                } catch (error) {
+                    toast(`下载失败：${String(error?.message ?? error)}`, 'error');
                 } finally {
                     currentBtn.disabled = Boolean(batch);
                 }
@@ -458,11 +414,10 @@ export default function activate(folium) {
             },
         });
     } catch {
-        /* commands registry is stable */
+        /* stable registry */
     }
 
     return () => {
-        offHook?.();
         tabsHandle.unregister();
         commandHandle?.unregister();
     };
