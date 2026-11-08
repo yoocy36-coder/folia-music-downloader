@@ -1,7 +1,7 @@
 // music-downloader / index.cjs
-// Node half of the mod: turn the audio Folia already cached for the current
-// song into a normal file in the user's Music folder. It never touches the
-// network; everything it writes comes from the local media cache.
+// Node half: copy the audio Folia already cached for a song into the user's
+// Music folder. It never touches the network; everything comes from the local
+// media cache.
 
 'use strict';
 
@@ -45,20 +45,27 @@ const sanitizeFileName = (value) => {
     return cleaned.slice(0, 120) || '未命名';
 };
 
-// Folia's configured cache directory lives in its config.json; the default is
-// <userData>/media-cache.
 const cacheDirectory = () => {
     try {
         const configPath = path.join(app.getPath('userData'), 'config.json');
         const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
         const configured = config?.CACHE_DIRECTORY;
-        if (typeof configured === 'string' && configured.trim()) {
-            return configured.trim();
-        }
+        if (typeof configured === 'string' && configured.trim()) return configured.trim();
     } catch {
-        /* fall through to the default */
+        /* default below */
     }
     return path.join(app.getPath('userData'), 'media-cache');
+};
+
+const cachePaths = (song) => {
+    const cacheKey = `audio_online:${song.source}:${song.id}`;
+    const baseName = crypto.createHash('sha256').update(cacheKey).digest('hex');
+    const audioDirectory = path.join(cacheDirectory(), 'audio');
+    return {
+        cacheKey,
+        dataPath: path.join(audioDirectory, `${baseName}.bin`),
+        metaPath: path.join(audioDirectory, `${baseName}.json`),
+    };
 };
 
 const sniffExtension = (filePath) => {
@@ -69,9 +76,32 @@ const sniffExtension = (filePath) => {
             if (text.includes(signature)) return extension;
         }
     } catch {
-        /* unreadable: fall through */
+        /* unreadable */
     }
     return 'bin';
+};
+
+const describeCache = (song) => {
+    if (!song || typeof song.source !== 'string' || typeof song.id !== 'string' || !song.source || !song.id) {
+        return { cached: false, reason: 'unsupported', size: 0, mimeType: null, extension: null };
+    }
+    const { dataPath, metaPath } = cachePaths(song);
+    let size = 0;
+    try {
+        size = fs.statSync(dataPath).size;
+    } catch {
+        return { cached: false, reason: 'missing', size: 0, mimeType: null, extension: null };
+    }
+    let mimeType = null;
+    try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        mimeType = typeof meta?.mimeType === 'string' ? meta.mimeType : null;
+    } catch {
+        /* meta optional */
+    }
+    let extension = MIME_EXTENSIONS[String(mimeType ?? '').toLowerCase()] ?? null;
+    if (!extension) extension = sniffExtension(dataPath);
+    return { cached: true, reason: 'cached', size, mimeType, extension };
 };
 
 const uniqueTarget = (directory, baseName, extension) => {
@@ -85,42 +115,32 @@ const uniqueTarget = (directory, baseName, extension) => {
 };
 
 module.exports = function activate(api) {
+    api.rpc.handle('status', (songs) => {
+        const list = Array.isArray(songs) ? songs.slice(0, 500) : [];
+        return list.map((song) => ({
+            ...describeCache(song),
+            source: typeof song?.source === 'string' ? song.source : null,
+            id: typeof song?.id === 'string' ? song.id : null,
+        }));
+    });
+
     api.rpc.handle('download', async (payload) => {
         const song = payload?.song ?? null;
-        if (!song || typeof song.source !== 'string' || typeof song.id !== 'string' || !song.source || !song.id) {
-            return { ok: false, code: 'unsupported-song' };
+        const info = describeCache(song);
+        if (!info.cached) {
+            return { ok: false, code: info.reason === 'unsupported' ? 'unsupported-song' : 'not-cached' };
         }
-
-        const cacheKey = `audio_online:${song.source}:${song.id}`;
-        const baseName = crypto.createHash('sha256').update(cacheKey).digest('hex');
-        const audioDirectory = path.join(cacheDirectory(), 'audio');
-        const dataPath = path.join(audioDirectory, `${baseName}.bin`);
-        const metaPath = path.join(audioDirectory, `${baseName}.json`);
-
-        let meta = null;
-        try {
-            meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-        } catch {
-            meta = null;
-        }
-        if (!fs.existsSync(dataPath)) {
-            return { ok: false, code: 'not-cached' };
-        }
-
-        let extension = MIME_EXTENSIONS[String(meta?.mimeType ?? '').toLowerCase()] ?? null;
-        if (!extension) extension = sniffExtension(dataPath);
-
+        const { dataPath } = cachePaths(song);
+        const extension = info.extension ?? 'bin';
         const musicDirectory = app.getPath('music');
         const displayName = sanitizeFileName(`${song.title ?? '未命名'} - ${song.artist ?? '未知歌手'}`);
         const targetPath = uniqueTarget(musicDirectory, displayName, extension);
-
         try {
             fs.copyFileSync(dataPath, targetPath);
         } catch (error) {
             return { ok: false, code: 'write-failed', detail: error?.message ?? null };
         }
 
-        // Lyrics ride along as a normal .lrc next to the audio file.
         let lyricsPath = null;
         const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
         if (lyrics.trim()) {
@@ -131,14 +151,13 @@ module.exports = function activate(api) {
                 lyricsPath = null;
             }
         }
-
-        let size = 0;
+        let size = info.size;
         try {
             size = fs.statSync(targetPath).size;
         } catch {
-            /* size is only informational */
+            /* keep the cached size */
         }
         api.log.info(`saved ${song.title ?? ''} to ${targetPath}`);
-        return { ok: true, filePath: targetPath, lyricsPath, extension, size, cacheKey };
+        return { ok: true, filePath: targetPath, lyricsPath, extension, size };
     });
 };
